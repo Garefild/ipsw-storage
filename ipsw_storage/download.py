@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import signal
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
@@ -11,6 +13,7 @@ import requests
 
 CHUNK_SIZE = 1024 * 1024
 REQUEST_TIMEOUT = 60
+PARTIAL_SUFFIX = ".part"
 ProgressCallback = Callable[["DownloadProgress"], None]
 
 
@@ -63,36 +66,64 @@ def _content_length(response: requests.Response) -> int | None:
         return None
 
 
+@contextmanager
+def _sigterm_raises_systemexit() -> Iterator[None]:
+    """Convert SIGTERM into SystemExit so partial-file cleanup runs."""
+
+    def handler(signum: int, frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    try:
+        previous = signal.signal(signal.SIGTERM, handler)
+    except (ValueError, OSError):
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def download_file(
     url: str,
     output_dir: str | PathLike[str],
     *,
     progress_callback: ProgressCallback | None = None,
 ) -> Path:
+    """Stream a URL to disk, removing the partial file if interrupted."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     target = output_dir / filename_from_url(url)
+    partial = target.with_name(target.name + PARTIAL_SUFFIX)
 
-    with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT) as response:
-        response.raise_for_status()
-        total = _content_length(response)
-        downloaded = 0
-        started_at = monotonic()
+    try:
+        with _sigterm_raises_systemexit():
+            with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT) as response:
+                response.raise_for_status()
+                total = _content_length(response)
+                downloaded = 0
+                started_at = monotonic()
 
-        with target.open("wb") as fp:
-            for chunk in response.iter_content(CHUNK_SIZE):
-                if chunk:
-                    fp.write(chunk)
-                    downloaded += len(chunk)
+                with partial.open("wb") as fp:
+                    for chunk in response.iter_content(CHUNK_SIZE):
+                        if chunk:
+                            fp.write(chunk)
+                            downloaded += len(chunk)
 
-                    if progress_callback is not None:
-                        progress_callback(
-                            DownloadProgress(
-                                downloaded=downloaded,
-                                total=total,
-                                elapsed=monotonic() - started_at,
-                            )
-                        )
+                            if progress_callback is not None:
+                                progress_callback(
+                                    DownloadProgress(
+                                        downloaded=downloaded,
+                                        total=total,
+                                        elapsed=monotonic() - started_at,
+                                    )
+                                )
+
+            partial.replace(target)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
 
     return target

@@ -53,6 +53,7 @@ def test_download_file_streams_to_target(
     assert target == tmp_path / "file.ipsw"
     assert target.read_bytes() == b"abcdef"
     assert calls == [("https://example.com/file.ipsw", True, download.REQUEST_TIMEOUT)]
+    assert not (tmp_path / ("file.ipsw" + download.PARTIAL_SUFFIX)).exists()
 
 
 def test_download_file_reports_progress(
@@ -75,3 +76,79 @@ def test_download_file_reports_progress(
     assert [item.downloaded for item in progress] == [3, 6]
     assert [item.total for item in progress] == [6, 6]
     assert progress[-1].percent == 100.0
+
+
+class InterruptingResponse:
+    headers = {"content-length": "6"}
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+    def __enter__(self) -> InterruptingResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, chunk_size: int):
+        yield b"abc"
+        raise self.exc
+
+
+def test_download_file_deletes_partial_on_keyboard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        download.requests,
+        "get",
+        lambda url, stream, timeout: InterruptingResponse(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        download.download_file("https://example.com/file.ipsw", tmp_path)
+
+    assert not (tmp_path / "file.ipsw").exists()
+    assert not (tmp_path / ("file.ipsw" + download.PARTIAL_SUFFIX)).exists()
+
+
+def test_download_file_deletes_partial_on_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        download.requests,
+        "get",
+        lambda url, stream, timeout: InterruptingResponse(
+            ConnectionError("network gone")
+        ),
+    )
+
+    with pytest.raises(ConnectionError):
+        download.download_file("https://example.com/file.ipsw", tmp_path)
+
+    assert not (tmp_path / "file.ipsw").exists()
+    assert not (tmp_path / ("file.ipsw" + download.PARTIAL_SUFFIX)).exists()
+
+
+def test_download_file_does_not_overwrite_existing_target_on_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing = tmp_path / "file.ipsw"
+    existing.write_bytes(b"original")
+
+    monkeypatch.setattr(
+        download.requests,
+        "get",
+        lambda url, stream, timeout: InterruptingResponse(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        download.download_file("https://example.com/file.ipsw", tmp_path)
+
+    assert existing.read_bytes() == b"original"
+    assert not (tmp_path / ("file.ipsw" + download.PARTIAL_SUFFIX)).exists()
